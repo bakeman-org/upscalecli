@@ -23,6 +23,8 @@ import (
 	"strings"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 
@@ -36,12 +38,21 @@ var embeddedBin []byte
 var embeddedModels embed.FS
 
 const (
+	// assetsVersion 用于区分不同版本的内嵌资源。替换了模型或二进制之后
+	// 把这个值改成 v2、v3…… 可以强制程序重新释放到缓存目录。
 	assetsVersion = "v1"
-	binName       = "realesrgan-ncnn-vulkan"
+
+	// binName 是 realesrgan-ncnn-vulkan 释放到缓存目录后的文件名。
+	binName = "realesrgan-ncnn-vulkan"
+
+	// 预览目录下的子目录名。保持 ASCII 避免跨平台兼容性问题。
+	dirOriginal = "original" // 原图
+	dirUpscaled = "upscaled" // 放大图
+	dirCompare  = "compare"  // 并排对比图
 )
 
 // ---------------------------------------------------------------------------
-// Config
+// 配置
 // ---------------------------------------------------------------------------
 
 type Config struct {
@@ -58,11 +69,14 @@ type Config struct {
 	Redo        bool
 	Offline     bool
 	ClearCache  bool
+	CleanAssets bool
 	List        bool
 	Open        bool
 	Compare     bool
 	NoHTML      bool
 	NoOrig      bool
+	TUI         bool
+	Example     bool
 	CacheDir    string
 	JPEGQuality int
 }
@@ -85,15 +99,28 @@ func parseFlags() Config {
 	flag.StringVar(&cfg.Pages, "pages", "", "页选择，例如 \"1,5,10-20\"（默认为全部）")
 	flag.BoolVar(&cfg.Redo, "redo", false, "对选中页忽略缓存，重新放大")
 	flag.BoolVar(&cfg.Offline, "offline", false, "仅使用缓存，绝不调用模型")
-	flag.BoolVar(&cfg.ClearCache, "clear-cache", false, "删除缓存目录并退出")
+	flag.BoolVar(&cfg.ClearCache, "clear-cache", false, "删除指定书的页缓存目录并退出")
+	flag.BoolVar(&cfg.CleanAssets, "clean-assets", false,
+		"删除内嵌资源释放目录（下次运行会重新释放），并退出")
 	flag.BoolVar(&cfg.List, "list", false, "列出已缓存的页并退出")
-	flag.BoolVar(&cfg.Open, "open", false, "完成后打开输出")
+	flag.BoolVar(&cfg.Open, "open", false, "完成后打开输出（浏览器/文件管理器）")
 	flag.BoolVar(&cfg.Compare, "compare", false, "生成原图/放大图并排对比图")
 	flag.BoolVar(&cfg.NoHTML, "no-html", false, "不生成 HTML 画廊")
 	flag.BoolVar(&cfg.NoOrig, "no-orig", false, "不提取原始图片")
-	flag.StringVar(&cfg.CacheDir, "cache-dir", "", "缓存目录（默认：<输入>.pages）")
+	flag.BoolVar(&cfg.TUI, "tui", false, "完成后启动终端 TUI 浏览器（需要 -outdir）")
+	flag.BoolVar(&cfg.Example, "example", false,
+		"打开示例命令 TUI 速查（可模糊过滤，Enter 复制到剪贴板）")
+	flag.StringVar(&cfg.CacheDir, "cache-dir", "", "页缓存目录（默认：<输入>.pages）")
 
 	flag.Parse()
+
+	// 纯展示类命令不需要输入文件
+	if cfg.Example {
+		return cfg
+	}
+	if cfg.CleanAssets && cfg.Input == "" {
+		return cfg
+	}
 
 	if cfg.Input == "" {
 		usage()
@@ -112,6 +139,10 @@ func parseFlags() Config {
 		fmt.Fprintln(os.Stderr, "错误：-compare 需要配合 -outdir 使用")
 		os.Exit(2)
 	}
+	if cfg.TUI && cfg.OutDir == "" {
+		fmt.Fprintln(os.Stderr, "错误：-tui 需要配合 -outdir 使用")
+		os.Exit(2)
+	}
 	return cfg
 }
 
@@ -126,31 +157,48 @@ func usage() {
   macOS   ~/Library/Caches/upscalecli/`+assetsVersion+`/
   Windows %LocalAppData%\upscalecli\`+assetsVersion+`\
 
-使用示例：
+──────────── 可直接复制的使用示例 ────────────
 
-  # 1. 预览前 6 页（带 HTML 画廊，自动打开浏览器）
+  # 0. 打开示例速查 TUI（模糊过滤，Enter 复制到剪贴板）
+  upscalecli --example
+
+  # 1. 预览前 6 页，带 HTML 画廊
   upscalecli -i case1.zip -outdir preview/ --pages 1-6 --open
 
-  # 2. 看效果满意后，处理整本并输出压缩包
+  # 2. 预览前 6 页，完成后直接进终端 TUI 浏览
+  upscalecli -i case1.zip -outdir preview/ --pages 1-6 --tui
+
+  # 3. 效果满意，处理整本并输出压缩包
   upscalecli -i case1.zip -o case1.4x.zip
 
-  # 3. 中断了？直接重新执行相同命令，已缓存的页秒回
+  # 4. 中断了？重新执行相同命令，已缓存的页秒回
   upscalecli -i case1.zip -o case1.4x.zip
 
-  # 4. 想重做第 42 页（比如换了模型）
+  # 5. 想重做第 42 页（比如换了模型）
   upscalecli -i case1.zip -outdir preview/ --pages 42 --redo -net realesrgan-x4plus
 
-  # 5. 无 GPU 的服务器，强制走 CPU（慢，但一定能跑）
+  # 6. 无 GPU 的服务器，强制走 CPU（慢，但一定能跑）
   upscalecli -i case1.zip -o case1.4x.zip -gpu -1
 
-  # 6. 生成原图/放大图并排对比（用于发帖/分享）
+  # 7. 生成原图 / 放大图并排对比（用于发帖/分享）
   upscalecli -i case1.zip -outdir review/ --compare
 
-  # 7. 离线重打包（只读缓存，不跑模型）
+  # 8. 离线重打包（只读缓存，不跑模型）
   upscalecli -i case1.zip -o case1.4x.zip --offline
 
-  # 8. 清空缓存从零开始
-  upscalecli -i case1.zip -outdir /tmp/x --clear-cache
+  # 9. 查看这本书已经缓存了多少页
+  upscalecli -i case1.zip -outdir preview/ --list
+
+  # 10. 清除某本书的页缓存
+  upscalecli -i case1.zip -outdir preview/ --clear-cache
+
+  # 11. 清除内嵌资源释放目录（下次运行自动重新释放）
+  upscalecli --clean-assets
+
+关于元数据自动修正：
+  当源压缩包里的图片是 WebP（Go 没有纯 Go 的 WebP 编码器）时，输出会改成 JPEG，
+  文件名后缀也会随之变化。为了让 comic_info.json / processed_comic_info.json
+  等元数据仍然有效，程序会自动把其中的 .webp 引用替换成 .jpg。
 
 参数说明：
 `)
@@ -158,21 +206,36 @@ func usage() {
 }
 
 // ---------------------------------------------------------------------------
-// Entry
+// Zip 条目
 // ---------------------------------------------------------------------------
 
 type entry struct {
 	f     *zip.File
-	index int
+	index int // 1 起算的图片序号；非图片条目为 0
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// 主流程
 // ---------------------------------------------------------------------------
 
 func main() {
 	log.SetFlags(log.Ltime)
 	cfg := parseFlags()
+
+	// 示例 TUI：不进入正常处理流程
+	if cfg.Example {
+		runExampleBrowser()
+		return
+	}
+
+	// 清理内嵌资源释放目录
+	if cfg.CleanAssets {
+		if err := cleanAssetsDir(); err != nil {
+			log.Fatalf("error: %v", err)
+		}
+		return
+	}
+
 	if err := run(cfg); err != nil {
 		log.Fatalf("error: %v", err)
 	}
@@ -260,19 +323,26 @@ func run(cfg Config) error {
 			cfg.Net, cfg.Scale, cfg.TileSize, cfg.GPUID)
 	}
 
-	var translated, reused, passed int
+	var upscaled, reused, passed int
+	var pages []previewPage
 
 	if cfg.OutDir != "" {
-		translated, reused, passed, err = runPreview(cfg, entries, totalImages, selection, cache, up)
+		upscaled, reused, passed, pages, err = runPreview(cfg, entries, totalImages, selection, cache, up)
 	} else {
-		translated, reused, passed, err = runArchive(cfg, entries, totalImages, selection, cache, up)
+		upscaled, reused, passed, err = runArchive(cfg, entries, totalImages, selection, cache, up)
 	}
 	if err != nil {
 		return err
 	}
 
-	log.Printf("汇总: 放大 %d 张，复用 %d 张，跳过 %d 张",
-		translated, reused, passed)
+	log.Printf("汇总: 放大 %d 张，复用 %d 张，跳过 %d 张", upscaled, reused, passed)
+
+	// 终端 TUI 浏览（仅预览模式支持）
+	if cfg.TUI && cfg.OutDir != "" {
+		if err := runTUI(cfg, pages); err != nil {
+			log.Printf("TUI 退出: %v", err)
+		}
+	}
 
 	if cfg.Open {
 		target := cfg.Output
@@ -299,7 +369,7 @@ func anySelected(sel []bool) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Asset release — bake realesrgan-ncnn-vulkan + models into the binary
+// 内嵌资源释放 / 清理
 // ---------------------------------------------------------------------------
 
 func assetCacheDir() (string, error) {
@@ -310,6 +380,21 @@ func assetCacheDir() (string, error) {
 	return filepath.Join(root, "upscalecli", assetsVersion), nil
 }
 
+// cleanAssetsDir 删除内嵌资源释放目录。下次运行时会被自动重新创建。
+func cleanAssetsDir() error {
+	root, err := assetCacheDir()
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(root); err != nil {
+		return fmt.Errorf("删除资源目录: %w", err)
+	}
+	fmt.Printf("已清除内嵌资源目录: %s\n", root)
+	fmt.Println("下次运行时将自动重新释放。")
+	return nil
+}
+
+// writeFileAtomic 先写临时文件再 rename，避免崩溃留下半个文件。
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, mode); err != nil {
@@ -318,8 +403,7 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return os.Rename(tmp, path)
 }
 
-// ensureAssets extracts the embedded binary and models to the per-user cache
-// directory once, and returns the paths.  Subsequent runs reuse the cache.
+// ensureAssets 把内嵌的二进制和模型释放到用户缓存目录，只做一次。
 func ensureAssets() (binPath, modelsDir string, err error) {
 	root, err := assetCacheDir()
 	if err != nil {
@@ -370,7 +454,130 @@ func ensureAssets() (binPath, modelsDir string, err error) {
 }
 
 // ---------------------------------------------------------------------------
-// Vulkan upscaler — runs the embedded realesrgan-ncnn-vulkan
+// 文件重命名映射 —— 元数据里的旧引用需要同步更新
+// ---------------------------------------------------------------------------
+
+// outputExtFor 计算一个源扩展名对应的输出扩展名。
+// WebP 没有纯 Go 编码器，输出为 JPEG；其他扩展名原样保留。
+func outputExtFor(origExt string) string {
+	if strings.EqualFold(origExt, ".webp") {
+		return ".jpg"
+	}
+	return origExt
+}
+
+// predictOutputName 预测一个图片条目放大后会用什么文件名。
+// 只做后缀推导，不做实际编码。
+func predictOutputName(origName string) string {
+	ext := filepath.Ext(origName)
+	newExt := outputExtFor(ext)
+	if newExt == ext {
+		return origName
+	}
+	return strings.TrimSuffix(origName, ext) + newExt
+}
+
+// isTextMetadata 判断一个条目是不是可能引用图片文件名的文本类元数据。
+func isTextMetadata(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".json", ".xml", ".txt", ".opf", ".comicinfo",
+		".yaml", ".yml", ".toml", ".csv", ".md", ".html", ".htm":
+		return true
+	}
+	return false
+}
+
+// isWordByte 判断一个字节是不是“标识符字符”，用于区分 .webp 到底是
+// 文件扩展名还是更长字符串的一部分。
+func isWordByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z':
+		return true
+	case b >= 'A' && b <= 'Z':
+		return true
+	case b >= '0' && b <= '9':
+		return true
+	case b == '_', b == '-':
+		return true
+	}
+	return false
+}
+
+// replaceExtSmart 把内容里的 oldExt 替换为 newExt，但跳过“词内匹配”。
+// 例如 ".webp" 后面跟着字母/数字/-/_ 时说明它是更长标识符的一部分，不替换。
+func replaceExtSmart(content []byte, oldExt, newExt string) []byte {
+	oldB := []byte(oldExt)
+	newB := []byte(newExt)
+	var out []byte
+	i := 0
+	for i < len(content) {
+		idx := bytes.Index(content[i:], oldB)
+		if idx < 0 {
+			out = append(out, content[i:]...)
+			break
+		}
+		absIdx := i + idx
+		endPos := absIdx + len(oldB)
+		// 检查后缀是不是词边界
+		if endPos < len(content) && isWordByte(content[endPos]) {
+			out = append(out, content[i:endPos]...)
+			i = endPos
+			continue
+		}
+		out = append(out, content[i:absIdx]...)
+		out = append(out, newB...)
+		i = endPos
+	}
+	return out
+}
+
+// applyRenames 依次应用完整路径替换和后缀替换。
+// 先做完整路径（最具体、最安全），再做后缀级别（用于只出现基名的情况）。
+func applyRenames(content []byte, renameMap, extChanges map[string]string) []byte {
+	for old, new := range renameMap {
+		content = bytes.ReplaceAll(content, []byte(old), []byte(new))
+	}
+	for oldExt, newExt := range extChanges {
+		content = replaceExtSmart(content, oldExt, newExt)
+	}
+	return content
+}
+
+// buildRenameMaps 预扫描所有图片条目，构建：
+//   - renameMap: 完整路径替换表
+//   - extChanges: 扩展名级替换表
+func buildRenameMaps(entries []entry) (renameMap, extChanges map[string]string, conflicts []string) {
+	renameMap = map[string]string{}
+	extChanges = map[string]string{}
+	seen := map[string]string{} // 最终输出名 → 源条目名，用于冲突检测
+
+	for _, e := range entries {
+		if e.index == 0 {
+			continue
+		}
+		oldName := e.f.Name
+		newName := predictOutputName(oldName)
+
+		if prev, ok := seen[newName]; ok && prev != oldName {
+			conflicts = append(conflicts, fmt.Sprintf("%q ← %q 与 %q", newName, prev, oldName))
+		}
+		seen[newName] = oldName
+
+		if newName == oldName {
+			continue
+		}
+		renameMap[oldName] = newName
+		oldExt := filepath.Ext(oldName)
+		newExt := filepath.Ext(newName)
+		if oldExt != newExt {
+			extChanges[oldExt] = newExt
+		}
+	}
+	return
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan 放大器 —— 调用内嵌的 realesrgan-ncnn-vulkan 子进程
 // ---------------------------------------------------------------------------
 
 type VulkanUpscaler struct {
@@ -420,6 +627,8 @@ func (u *VulkanUpscaler) Destroy() {
 	}
 }
 
+// Upscale 把一张图片交给 realesrgan-ncnn-vulkan 处理。
+// realesrgan-ncnn-vulkan 只接受文件路径，所以先落盘为 PNG，处理完再读回来。
 func (u *VulkanUpscaler) Upscale(img image.Image) (image.Image, error) {
 	inPath := filepath.Join(u.tmpDir, "in.png")
 	outPath := filepath.Join(u.tmpDir, "out.png")
@@ -485,10 +694,20 @@ func lastLines(s string, n int) string {
 }
 
 // ---------------------------------------------------------------------------
-// Archive mode
+// 压缩包模式 —— 输出一个新的 .cbz / .zip
 // ---------------------------------------------------------------------------
 
 func runArchive(cfg Config, entries []entry, total int, selection []bool, cache *PageCache, up *VulkanUpscaler) (int, int, int, error) {
+	// 预扫描：找出会被改名的图片条目，并构建元数据替换表
+	renameMap, extChanges, conflicts := buildRenameMaps(entries)
+	if len(renameMap) > 0 {
+		log.Printf("检测到 %d 个条目会改名（例如 WebP → JPEG），将同步更新元数据引用",
+			len(renameMap))
+	}
+	for _, c := range conflicts {
+		log.Printf("警告：输出文件名冲突 — %s", c)
+	}
+
 	out, err := os.Create(cfg.Output)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("创建输出: %w", err)
@@ -498,7 +717,8 @@ func runArchive(cfg Config, entries []entry, total int, selection []bool, cache 
 	zw := zip.NewWriter(out)
 	defer zw.Close()
 
-	var translated, reused, passed int
+	var upscaled, reused, passed int
+	metaUpdated := 0
 
 	writeEntry := func(name string, mode os.FileMode, modified time.Time, data []byte) error {
 		hdr := &zip.FileHeader{Name: name, Method: zip.Deflate, Modified: modified}
@@ -530,6 +750,16 @@ func runArchive(cfg Config, entries []entry, total int, selection []bool, cache 
 		}
 
 		if e.index == 0 {
+			// 非图片条目：如果是文本类元数据，同步更新里面的图片引用
+			if (len(renameMap) > 0 || len(extChanges) > 0) && isTextMetadata(f.Name) {
+				rewritten := applyRenames(raw, renameMap, extChanges)
+				if !bytes.Equal(rewritten, raw) {
+					log.Printf("%s: 更新元数据中的图片引用 (%d → %d 字节)",
+						f.Name, len(raw), len(rewritten))
+					raw = rewritten
+					metaUpdated++
+				}
+			}
 			if err := writeEntry(f.Name, f.Mode(), f.Modified, raw); err != nil {
 				return 0, 0, 0, err
 			}
@@ -578,7 +808,7 @@ func runArchive(cfg Config, entries []entry, total int, selection []bool, cache 
 			continue
 		}
 
-		upscaled, err := up.Upscale(img)
+		result, err := up.Upscale(img)
 		if err != nil {
 			log.Printf("%s: 放大失败 (%v)，原样复制", prefix, err)
 			if err := writeEntry(f.Name, f.Mode(), f.Modified, raw); err != nil {
@@ -588,7 +818,7 @@ func runArchive(cfg Config, entries []entry, total int, selection []bool, cache 
 			continue
 		}
 
-		outName, data, err := encodeOutput(f.Name, upscaled, cfg)
+		outName, data, err := encodeOutput(f.Name, result, cfg)
 		if err != nil {
 			return 0, 0, 0, fmt.Errorf("编码 %s: %w", f.Name, err)
 		}
@@ -599,43 +829,48 @@ func runArchive(cfg Config, entries []entry, total int, selection []bool, cache 
 			return 0, 0, 0, err
 		}
 		log.Printf("%s: 完成，耗时 %.1fs", prefix, time.Since(start).Seconds())
-		translated++
+		upscaled++
 	}
-	return translated, reused, passed, nil
+
+	if metaUpdated > 0 {
+		log.Printf("已更新 %d 个元数据文件中的图片引用", metaUpdated)
+	}
+
+	return upscaled, reused, passed, nil
 }
 
 // ---------------------------------------------------------------------------
-// Preview mode
+// 预览模式 —— 输出到目录，便于人工检查
 // ---------------------------------------------------------------------------
 
 type previewPage struct {
-	Index   int
-	Name    string
-	OrigRel string
-	TrRel   string
+	Index   int    // 1 起算的页号
+	Name    string // 原始 zip 内的路径
+	OrigRel string // 相对 outdir 的原图路径（正斜杠）
+	UpRel   string // 相对 outdir 的放大图路径（正斜杠）
 }
 
-func runPreview(cfg Config, entries []entry, total int, selection []bool, cache *PageCache, up *VulkanUpscaler) (int, int, int, error) {
-	origDir := filepath.Join(cfg.OutDir, "original")
-	trDir := filepath.Join(cfg.OutDir, "translated")
-	cmpDir := filepath.Join(cfg.OutDir, "compare")
+func runPreview(cfg Config, entries []entry, total int, selection []bool, cache *PageCache, up *VulkanUpscaler) (int, int, int, []previewPage, error) {
+	origDir := filepath.Join(cfg.OutDir, dirOriginal)
+	upDir := filepath.Join(cfg.OutDir, dirUpscaled)
+	cmpDir := filepath.Join(cfg.OutDir, dirCompare)
 
 	if !cfg.NoOrig {
 		if err := os.MkdirAll(origDir, 0o755); err != nil {
-			return 0, 0, 0, err
+			return 0, 0, 0, nil, err
 		}
 	}
-	if err := os.MkdirAll(trDir, 0o755); err != nil {
-		return 0, 0, 0, err
+	if err := os.MkdirAll(upDir, 0o755); err != nil {
+		return 0, 0, 0, nil, err
 	}
 	if cfg.Compare {
 		if err := os.MkdirAll(cmpDir, 0o755); err != nil {
-			return 0, 0, 0, err
+			return 0, 0, 0, nil, err
 		}
 	}
 
 	var pages []previewPage
-	var translated, reused, passed int
+	var upscaled, reused, passed int
 
 	writeFile := func(root, rel string, data []byte) error {
 		full := filepath.Join(root, filepath.FromSlash(rel))
@@ -654,13 +889,13 @@ func runPreview(cfg Config, entries []entry, total int, selection []bool, cache 
 
 		raw, err := readZipEntry(f)
 		if err != nil {
-			return 0, 0, 0, fmt.Errorf("读取 %s: %w", f.Name, err)
+			return 0, 0, 0, nil, fmt.Errorf("读取 %s: %w", f.Name, err)
 		}
 
 		if e.index == 0 {
 			if !cfg.NoOrig {
 				if err := writeFile(origDir, f.Name, raw); err != nil {
-					return 0, 0, 0, err
+					return 0, 0, 0, nil, err
 				}
 			}
 			continue
@@ -668,9 +903,10 @@ func runPreview(cfg Config, entries []entry, total int, selection []bool, cache 
 
 		prefix := fmt.Sprintf("[%d/%d] %s", e.index, total, f.Name)
 
+		// 原图总是先落地，方便对比
 		if !cfg.NoOrig {
 			if err := writeFile(origDir, f.Name, raw); err != nil {
-				return 0, 0, 0, err
+				return 0, 0, 0, nil, err
 			}
 		}
 
@@ -705,31 +941,32 @@ func runPreview(cfg Config, entries []entry, total int, selection []bool, cache 
 					outName, outData = f.Name, raw
 					passed++
 				} else {
-					upscaled, err := up.Upscale(img)
+					result, err := up.Upscale(img)
 					if err != nil {
 						log.Printf("%s: 放大失败 (%v)", prefix, err)
 						outName, outData = f.Name, raw
 						passed++
 					} else {
-						name, data, err := encodeOutput(f.Name, upscaled, cfg)
+						name, data, err := encodeOutput(f.Name, result, cfg)
 						if err != nil {
-							return 0, 0, 0, fmt.Errorf("编码 %s: %w", f.Name, err)
+							return 0, 0, 0, nil, fmt.Errorf("编码 %s: %w", f.Name, err)
 						}
 						if err := cache.put(e.index, f.Name, name, data); err != nil {
 							log.Printf("%s: 缓存写入失败: %v", prefix, err)
 						}
 						outName, outData = name, data
 						log.Printf("%s: 完成，耗时 %.1fs", prefix, time.Since(start).Seconds())
-						translated++
+						upscaled++
 					}
 				}
 			}
 		}
 
-		if err := writeFile(trDir, outName, outData); err != nil {
-			return 0, 0, 0, err
+		if err := writeFile(upDir, outName, outData); err != nil {
+			return 0, 0, 0, nil, err
 		}
 
+		// 可选：生成并排对比图
 		if cfg.Compare {
 			composite, err := makeCompare(raw, outData)
 			if err != nil {
@@ -738,7 +975,7 @@ func runPreview(cfg Config, entries []entry, total int, selection []bool, cache 
 				base := strings.TrimSuffix(filepath.Base(outName), filepath.Ext(outName)) + ".jpg"
 				rel := filepath.ToSlash(filepath.Join(filepath.Dir(outName), base))
 				if err := writeFile(cmpDir, rel, composite); err != nil {
-					return 0, 0, 0, err
+					return 0, 0, 0, nil, err
 				}
 			}
 		}
@@ -747,35 +984,36 @@ func runPreview(cfg Config, entries []entry, total int, selection []bool, cache 
 			Index:   e.index,
 			Name:    f.Name,
 			OrigRel: filepath.ToSlash(f.Name),
-			TrRel:   filepath.ToSlash(outName),
+			UpRel:   filepath.ToSlash(outName),
 		})
 	}
 
+	// HTML 画廊（可选）
 	if !cfg.NoHTML {
 		if err := writeGallery(cfg, pages); err != nil {
-			return 0, 0, 0, fmt.Errorf("生成 HTML: %w", err)
+			return 0, 0, 0, nil, fmt.Errorf("生成 HTML: %w", err)
 		}
 	}
-	return translated, reused, passed, nil
+	return upscaled, reused, passed, pages, nil
 }
 
 // ---------------------------------------------------------------------------
-// Compare composite
+// 并排对比图
 // ---------------------------------------------------------------------------
 
-func makeCompare(origBytes, transBytes []byte) ([]byte, error) {
+func makeCompare(origBytes, upBytes []byte) ([]byte, error) {
 	orig, _, err := image.Decode(bytes.NewReader(origBytes))
 	if err != nil {
 		return nil, err
 	}
-	trans, _, err := image.Decode(bytes.NewReader(transBytes))
+	up, _, err := image.Decode(bytes.NewReader(upBytes))
 	if err != nil {
 		return nil, err
 	}
 
-	ob, tb := orig.Bounds(), trans.Bounds()
+	ob, ub := orig.Bounds(), up.Bounds()
 	origH := ob.Dy()
-	targetH := tb.Dy()
+	targetH := ub.Dy()
 	if origH != targetH {
 		ratio := float64(targetH) / float64(origH)
 		newW := int(float64(ob.Dx()) * ratio)
@@ -786,12 +1024,12 @@ func makeCompare(origBytes, transBytes []byte) ([]byte, error) {
 	}
 
 	const gap = 20
-	W := ob.Dx() + gap + tb.Dx()
+	W := ob.Dx() + gap + ub.Dx()
 	H := targetH
 	dst := image.NewRGBA(image.Rect(0, 0, W, H))
 	draw.Draw(dst, dst.Bounds(), image.NewUniform(color.RGBA{25, 25, 25, 255}), image.Point{}, draw.Src)
 	draw.Draw(dst, image.Rect(0, 0, ob.Dx(), ob.Dy()), orig, ob.Min, draw.Src)
-	draw.Draw(dst, image.Rect(ob.Dx()+gap, 0, ob.Dx()+gap+tb.Dx(), tb.Dy()), trans, tb.Min, draw.Src)
+	draw.Draw(dst, image.Rect(ob.Dx()+gap, 0, ob.Dx()+gap+ub.Dx(), ub.Dy()), up, ub.Min, draw.Src)
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 85}); err != nil {
@@ -801,7 +1039,475 @@ func makeCompare(origBytes, transBytes []byte) ([]byte, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Cache
+// 剪贴板 —— 支持 Wayland / X11 / macOS / Windows
+// ---------------------------------------------------------------------------
+
+func clipboardCommand() (*exec.Cmd, error) {
+	if os.Getenv("WAYLAND_DISPLAY") != "" {
+		if p, err := exec.LookPath("wl-copy"); err == nil {
+			return exec.Command(p), nil
+		}
+	}
+	if os.Getenv("DISPLAY") != "" {
+		if p, err := exec.LookPath("xclip"); err == nil {
+			return exec.Command(p, "-selection", "clipboard"), nil
+		}
+		if p, err := exec.LookPath("xsel"); err == nil {
+			return exec.Command(p, "--clipboard", "--input"), nil
+		}
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		if p, err := exec.LookPath("pbcopy"); err == nil {
+			return exec.Command(p), nil
+		}
+	case "windows":
+		if p, err := exec.LookPath("clip"); err == nil {
+			return exec.Command(p), nil
+		}
+	}
+	return nil, errors.New(
+		"未找到剪贴板工具：\n" +
+			"  Wayland 请安装 wl-clipboard（提供 wl-copy）\n" +
+			"  X11     请安装 xclip 或 xsel")
+}
+
+func copyToClipboard(text string) error {
+	cmd, err := clipboardCommand()
+	if err != nil {
+		return err
+	}
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
+}
+
+// ---------------------------------------------------------------------------
+// 示例速查 TUI（模糊过滤 + Enter 复制）
+// ---------------------------------------------------------------------------
+
+type exampleItem struct {
+	title string
+	cmd   string
+}
+
+var builtinExamples = []exampleItem{
+	{"预览前 6 页（带 HTML 画廊）",
+		"upscalecli -i case1.zip -outdir preview/ --pages 1-6 --open"},
+	{"预览前 6 页（完成后进终端 TUI 浏览）",
+		"upscalecli -i case1.zip -outdir preview/ --pages 1-6 --tui"},
+	{"处理整本并输出压缩包",
+		"upscalecli -i case1.zip -o case1.4x.zip"},
+	{"断点续传：中断后重新执行相同命令即可",
+		"upscalecli -i case1.zip -o case1.4x.zip"},
+	{"重做第 42 页（例如换了模型之后）",
+		"upscalecli -i case1.zip -outdir preview/ --pages 42 --redo -net realesrgan-x4plus"},
+	{"无 GPU 服务器：强制走 CPU",
+		"upscalecli -i case1.zip -o case1.4x.zip -gpu -1"},
+	{"生成原图 / 放大图并排对比",
+		"upscalecli -i case1.zip -outdir review/ --compare"},
+	{"离线重打包（只读缓存，不跑模型）",
+		"upscalecli -i case1.zip -o case1.4x.zip --offline"},
+	{"查看这本书已经缓存了多少页",
+		"upscalecli -i case1.zip -outdir preview/ --list"},
+	{"清除某本书的页缓存",
+		"upscalecli -i case1.zip -outdir preview/ --clear-cache"},
+	{"清除内嵌资源释放目录（下次运行自动重建）",
+		"upscalecli --clean-assets"},
+	{"换用通用模型（照片 / 写实画面）",
+		"upscalecli -i case1.zip -o case1.4x.zip -net realesrgan-x4plus"},
+	{"换用动画视频帧模型，2 倍放大",
+		"upscalecli -i case1.zip -o case1.2x.zip -net realesr-animevideov3 -scale 2"},
+	{"限制 tile 大小以节省显存",
+		"upscalecli -i case1.zip -o case1.4x.zip -tile 128"},
+	{"自定义 JPEG 输出质量",
+		"upscalecli -i case1.zip -o case1.4x.zip -jpeg-quality 88"},
+	{"指定页缓存目录（避免放在只读输入旁边）",
+		"upscalecli -i case1.zip -o case1.4x.zip --cache-dir /tmp/case1.pages"},
+}
+
+type exampleModel struct {
+	items    []exampleItem
+	filtered []int
+	query    string
+	cursor   int
+	width    int
+	height   int
+	status   string
+	chosen   *exampleItem
+}
+
+func newExampleModel() exampleModel {
+	m := exampleModel{
+		items:  builtinExamples,
+		width:  80,
+		height: 24,
+	}
+	m.applyFilter()
+	return m
+}
+
+func (m *exampleModel) applyFilter() {
+	q := strings.ToLower(m.query)
+	m.filtered = m.filtered[:0]
+	for i, e := range m.items {
+		if q == "" ||
+			strings.Contains(strings.ToLower(e.title), q) ||
+			strings.Contains(strings.ToLower(e.cmd), q) {
+			m.filtered = append(m.filtered, i)
+		}
+	}
+	if m.cursor >= len(m.filtered) {
+		m.cursor = len(m.filtered) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+}
+
+func (m exampleModel) Init() tea.Cmd { return nil }
+
+func (m exampleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyCtrlC, tea.KeyEsc:
+			return m, tea.Quit
+		case tea.KeyEnter:
+			if len(m.filtered) == 0 {
+				return m, nil
+			}
+			it := m.items[m.filtered[m.cursor]]
+			if err := copyToClipboard(it.cmd); err != nil {
+				m.status = "复制失败：" + err.Error()
+				return m, nil
+			}
+			m.chosen = &it
+			return m, tea.Quit
+		case tea.KeyUp, tea.KeyCtrlP:
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		case tea.KeyDown, tea.KeyCtrlN:
+			if m.cursor < len(m.filtered)-1 {
+				m.cursor++
+			}
+		case tea.KeyHome:
+			m.cursor = 0
+		case tea.KeyEnd:
+			if len(m.filtered) > 0 {
+				m.cursor = len(m.filtered) - 1
+			}
+		case tea.KeyBackspace:
+			if len(m.query) > 0 {
+				m.query = m.query[:len(m.query)-1]
+				m.applyFilter()
+			}
+		case tea.KeyDelete:
+			m.query = ""
+			m.applyFilter()
+		case tea.KeyRunes:
+			m.query += string(msg.Runes)
+			m.applyFilter()
+		case tea.KeySpace:
+			m.query += " "
+			m.applyFilter()
+		}
+	}
+	return m, nil
+}
+
+func (m exampleModel) View() string {
+	var (
+		titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+		labelStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+		queryStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+		cursorStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+		itemStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+		dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+		cmdStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
+		statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	)
+
+	var sb strings.Builder
+
+	sb.WriteString(titleStyle.Render("upscalecli 示例速查"))
+	sb.WriteString("  ")
+	sb.WriteString(labelStyle.Render("输入关键字过滤 · Enter 复制到剪贴板并退出"))
+	sb.WriteString("\n\n")
+
+	sb.WriteString(labelStyle.Render("过滤: "))
+	if m.query == "" {
+		sb.WriteString(dimStyle.Render("（直接输入以过滤）"))
+	} else {
+		sb.WriteString(queryStyle.Render(m.query))
+	}
+	sb.WriteString(dimStyle.Render("█"))
+	sb.WriteString("\n\n")
+
+	listHeight := m.height - 12
+	if listHeight < 3 {
+		listHeight = 3
+	}
+	if len(m.filtered) == 0 {
+		sb.WriteString(dimStyle.Render("没有匹配的示例。"))
+		sb.WriteString("\n")
+	} else {
+		start := 0
+		if m.cursor >= listHeight {
+			start = m.cursor - listHeight + 1
+		}
+		end := start + listHeight
+		if end > len(m.filtered) {
+			end = len(m.filtered)
+		}
+		for vi := start; vi < end; vi++ {
+			idx := m.filtered[vi]
+			it := m.items[idx]
+			if vi == m.cursor {
+				sb.WriteString(cursorStyle.Render("▸ "))
+				sb.WriteString(cursorStyle.Render(it.title))
+			} else {
+				sb.WriteString(itemStyle.Render("  " + it.title))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(labelStyle.Render("命令预览:"))
+	sb.WriteString("\n")
+	if len(m.filtered) > 0 {
+		sb.WriteString("  ")
+		sb.WriteString(cmdStyle.Render(m.items[m.filtered[m.cursor]].cmd))
+	}
+	sb.WriteString("\n")
+
+	if m.status != "" {
+		sb.WriteString(statusStyle.Render(m.status))
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString(dimStyle.Render("↑/↓ 选择 · Enter 复制并退出 · Esc 取消 · 输入字符过滤 · Backspace 删除"))
+	return sb.String()
+}
+
+func runExampleBrowser() {
+	if !isTerminal(os.Stdout) {
+		for _, e := range builtinExamples {
+			fmt.Printf("# %s\n%s\n\n", e.title, e.cmd)
+		}
+		return
+	}
+
+	if _, err := clipboardCommand(); err != nil {
+		fmt.Fprintln(os.Stderr, "提示：", err)
+		fmt.Fprintln(os.Stderr, "（TUI 仍可使用，但 Enter 无法自动复制）")
+	}
+
+	p := tea.NewProgram(newExampleModel(), tea.WithAltScreen())
+	finalModel, err := p.Run()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "TUI 启动失败:", err)
+		for _, e := range builtinExamples {
+			fmt.Printf("# %s\n%s\n\n", e.title, e.cmd)
+		}
+		return
+	}
+
+	if m, ok := finalModel.(exampleModel); ok && m.chosen != nil {
+		fmt.Println("已复制到剪贴板：")
+		fmt.Println(m.chosen.cmd)
+	}
+}
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// ---------------------------------------------------------------------------
+// 预览 TUI（bubbletea）—— 用半块字符显示图片
+// ---------------------------------------------------------------------------
+
+type tuiModel struct {
+	pages    []previewPage
+	outDir   string
+	index    int
+	mode     string
+	width    int
+	height   int
+	imageStr string
+}
+
+func initialTUIModel(outDir string, pages []previewPage) tuiModel {
+	return tuiModel{
+		pages:  pages,
+		outDir: outDir,
+		index:  0,
+		mode:   "upscaled",
+		width:  80,
+		height: 24,
+	}
+}
+
+func (m tuiModel) Init() tea.Cmd { return nil }
+
+func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.imageStr = ""
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "esc", "ctrl+c":
+			return m, tea.Quit
+		case "left", "h", "a":
+			if m.index > 0 {
+				m.index--
+				m.imageStr = ""
+			}
+		case "right", "l", "d":
+			if m.index < len(m.pages)-1 {
+				m.index++
+				m.imageStr = ""
+			}
+		case "home", "g":
+			m.index = 0
+			m.imageStr = ""
+		case "end", "G":
+			m.index = len(m.pages) - 1
+			m.imageStr = ""
+		case " ", "tab":
+			if m.mode == "orig" {
+				m.mode = "upscaled"
+			} else {
+				m.mode = "orig"
+			}
+			m.imageStr = ""
+		case "o":
+			m.mode = "orig"
+			m.imageStr = ""
+		case "u", "t":
+			m.mode = "upscaled"
+			m.imageStr = ""
+		}
+	}
+	return m, nil
+}
+
+func (m tuiModel) View() string {
+	if len(m.pages) == 0 {
+		return "没有可预览的页面。按 q 退出。"
+	}
+
+	if m.imageStr == "" {
+		img, err := m.loadCurrentImage()
+		if err != nil {
+			m.imageStr = "（无法加载图片： " + err.Error() + "）"
+		} else {
+			m.imageStr = renderImageHalfBlock(img, m.width, m.height-5)
+		}
+	}
+
+	p := m.pages[m.index]
+	modeLabel := "放大图"
+	if m.mode == "orig" {
+		modeLabel = "原图"
+	}
+
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	infoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	hintStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+
+	bar := titleStyle.Render("Real-ESRGAN 预览") +
+		infoStyle.Render(fmt.Sprintf("  %d/%d  ·  %s  ·  %s",
+			m.index+1, len(m.pages), p.Name, modeLabel))
+
+	hint := hintStyle.Render(
+		"←/→ 翻页 · 空格 切换原图/放大图 · o 原图 · u 放大图 · g/G 首尾 · q 退出")
+
+	return bar + "\n\n" + m.imageStr + "\n" + hint
+}
+
+func (m tuiModel) loadCurrentImage() (image.Image, error) {
+	p := m.pages[m.index]
+	var rel string
+	if m.mode == "orig" {
+		rel = filepath.Join(dirOriginal, p.OrigRel)
+	} else {
+		rel = filepath.Join(dirUpscaled, p.UpRel)
+	}
+	full := filepath.Join(m.outDir, rel)
+	return readImage(full)
+}
+
+// renderImageHalfBlock 把图像缩放到终端尺寸，再用半块字符（▀）显示。
+func renderImageHalfBlock(img image.Image, maxWidth, maxHeight int) string {
+	if maxWidth < 4 {
+		maxWidth = 4
+	}
+	if maxHeight < 2 {
+		maxHeight = 2
+	}
+
+	b := img.Bounds()
+	iw, ih := b.Dx(), b.Dy()
+	if iw == 0 || ih == 0 {
+		return "（空图像）"
+	}
+
+	targetW := maxWidth
+	targetH := targetW * ih / (iw * 2)
+	if targetH > maxHeight {
+		targetH = maxHeight
+		targetW = targetH * 2 * iw / ih
+	}
+	if targetW < 1 {
+		targetW = 1
+	}
+	if targetH < 1 {
+		targetH = 1
+	}
+
+	scaledH := targetH * 2
+	scaled := image.NewRGBA(image.Rect(0, 0, targetW, scaledH))
+	xdraw.CatmullRom.Scale(scaled, scaled.Bounds(), img, b, xdraw.Over, nil)
+
+	var sb strings.Builder
+	for y := 0; y < targetH; y++ {
+		for x := 0; x < targetW; x++ {
+			topR, topG, topB, _ := scaled.At(x, y*2).RGBA()
+			botR, botG, botB, _ := scaled.At(x, y*2+1).RGBA()
+			fmt.Fprintf(&sb,
+				"\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm▀",
+				topR>>8, topG>>8, topB>>8,
+				botR>>8, botG>>8, botB>>8,
+			)
+		}
+		sb.WriteString("\x1b[0m\n")
+	}
+	return sb.String()
+}
+
+func runTUI(cfg Config, pages []previewPage) error {
+	if len(pages) == 0 {
+		return errors.New("没有可预览的页面")
+	}
+	model := initialTUIModel(cfg.OutDir, pages)
+	p := tea.NewProgram(model, tea.WithAltScreen())
+	_, err := p.Run()
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// 页缓存
 // ---------------------------------------------------------------------------
 
 type PageCache struct {
@@ -900,7 +1606,7 @@ func (c *PageCache) save() error {
 }
 
 // ---------------------------------------------------------------------------
-// Zip / image helpers
+// Zip / 图像辅助
 // ---------------------------------------------------------------------------
 
 func readZipEntry(f *zip.File) ([]byte, error) {
@@ -933,21 +1639,25 @@ func isImageEntry(name string) bool {
 	return false
 }
 
+// encodeOutput 输出图片。输出文件名与 predictOutputName 保持一致：
+// WebP 源会被改名成 .jpg（Go 没有纯 Go 的 WebP 编码器）。
 func encodeOutput(origName string, img image.Image, cfg Config) (string, []byte, error) {
-	ext := strings.ToLower(filepath.Ext(origName))
-	outName := origName
+	origExt := filepath.Ext(origName)
+	outExt := outputExtFor(origExt)
+	outName := strings.TrimSuffix(origName, origExt) + outExt
+
 	var buf bytes.Buffer
-	switch ext {
+	switch strings.ToLower(outExt) {
 	case ".jpg", ".jpeg":
 		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: cfg.JPEGQuality}); err != nil {
 			return "", nil, err
 		}
-	case ".webp":
-		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: cfg.JPEGQuality}); err != nil {
+	case ".png":
+		if err := png.Encode(&buf, img); err != nil {
 			return "", nil, err
 		}
-		outName = strings.TrimSuffix(outName, filepath.Ext(outName)) + ".jpg"
 	default:
+		// 兜底：未知扩展名按 PNG 输出
 		if err := png.Encode(&buf, img); err != nil {
 			return "", nil, err
 		}
@@ -956,7 +1666,7 @@ func encodeOutput(origName string, img image.Image, cfg Config) (string, []byte,
 }
 
 // ---------------------------------------------------------------------------
-// Page selection
+// 页选择
 // ---------------------------------------------------------------------------
 
 func parsePages(spec string, total int) ([]bool, error) {
@@ -1008,7 +1718,7 @@ func parsePages(spec string, total int) ([]bool, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Cache listing
+// 缓存列表
 // ---------------------------------------------------------------------------
 
 func listCache(entries []entry, total int, cache *PageCache) error {
@@ -1047,21 +1757,21 @@ func truncate(s string, n int) string {
 }
 
 // ---------------------------------------------------------------------------
-// HTML gallery
+// HTML 画廊（浏览器友好版）
 // ---------------------------------------------------------------------------
 
 func writeGallery(cfg Config, pages []previewPage) error {
 	type item struct {
-		Name  string `json:"name"`
-		Orig  string `json:"orig"`
-		Trans string `json:"trans"`
+		Name string `json:"name"`
+		Orig string `json:"orig"`
+		Up   string `json:"up"`
 	}
 	items := make([]item, 0, len(pages))
 	for _, p := range pages {
 		items = append(items, item{
-			Name:  p.Name,
-			Orig:  "original/" + p.OrigRel,
-			Trans: "translated/" + p.TrRel,
+			Name: p.Name,
+			Orig: dirOriginal + "/" + p.OrigRel,
+			Up:   dirUpscaled + "/" + p.UpRel,
 		})
 	}
 	payload, err := json.Marshal(items)
@@ -1102,8 +1812,8 @@ const galleryTemplate = `<!DOCTYPE html>
   #bar .grow { flex: 1; }
   #bar .info { color: #888; font-variant-numeric: tabular-nums; }
   #bar .badge { background: #333; padding: 3px 8px; border-radius: 3px; color: #aaa; }
-  #bar .badge.trans { background: #2d4a2d; color: #b8e6b8; }
-  #bar .badge.orig  { background: #4a3d2d; color: #e6d0a8; }
+  #bar .badge.up  { background: #2d4a2d; color: #b8e6b8; }
+  #bar .badge.orig { background: #4a3d2d; color: #e6d0a8; }
   #stage { display: flex; align-items: center; justify-content: center;
            min-height: 100vh; padding-top: 60px; box-sizing: border-box; }
   #stage img { max-width: 100vw; max-height: calc(100vh - 80px); display: block; }
@@ -1127,7 +1837,7 @@ const galleryTemplate = `<!DOCTYPE html>
 <script>
   const pages = __PAGES__;
   let i = 0;
-  let mode = "trans";
+  let mode = "up";
   const $img   = document.getElementById("img");
   const $info  = document.getElementById("info");
   const $badge = document.getElementById("badge");
@@ -1136,7 +1846,7 @@ const galleryTemplate = `<!DOCTYPE html>
   function render() {
     if (!pages.length) return;
     const p = pages[i];
-    $img.src = (mode === "orig") ? p.orig : p.trans;
+    $img.src = (mode === "orig") ? p.orig : p.up;
     $info.textContent = (i+1) + " / " + pages.length;
     $badge.textContent = mode === "orig" ? "原图" : "放大图";
     $badge.className = "badge " + mode;
@@ -1144,7 +1854,7 @@ const galleryTemplate = `<!DOCTYPE html>
     document.title = p.name + " — " + (i+1) + "/" + pages.length;
   }
   function setMode(m) { mode = m; render(); }
-  function toggle()   { setMode(mode === "trans" ? "orig" : "trans"); }
+  function toggle()   { setMode(mode === "up" ? "orig" : "up"); }
   function prev()     { if (i > 0) { i--; render(); } }
   function next()     { if (i < pages.length - 1) { i++; render(); } }
 
@@ -1158,7 +1868,7 @@ const galleryTemplate = `<!DOCTYPE html>
       case "ArrowRight": next(); break;
       case " ":          e.preventDefault(); toggle(); break;
       case "o": case "O": setMode("orig"); break;
-      case "t": case "T": setMode("trans"); break;
+      case "t": case "T": setMode("up"); break;
       case "Home": i = 0; render(); break;
       case "End":  i = pages.length - 1; render(); break;
     }
@@ -1170,7 +1880,7 @@ const galleryTemplate = `<!DOCTYPE html>
 `
 
 // ---------------------------------------------------------------------------
-// Open in file manager
+// 用系统默认程序打开
 // ---------------------------------------------------------------------------
 
 func openPath(p string) error {

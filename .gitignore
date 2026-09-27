@@ -2,3 +2,6 @@ assets/
 case1.zip
 *.zip
 upscalecli
+preview/
+case*.pages/
+4x/
