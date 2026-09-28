@@ -1,0 +1,25 @@
+name: sample_client
+description: Android/Flutter client for the upscale-server.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  dio: ^5.7.0
+  file_picker: ^8.1.4
+  path_provider: ^2.1.5
+  permission_handler: ^11.3.1
+  open_filex: ^4.5.0
+  share_plus: ^10.1.2
+  shared_preferences: ^2.5.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
